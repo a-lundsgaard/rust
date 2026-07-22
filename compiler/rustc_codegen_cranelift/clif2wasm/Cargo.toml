@@ -1,0 +1,27 @@
+[package]
+name = "clif2wasm"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[features]
+# S4 seam: the cranelift_module::Module impl (WasmModule). Pulls in cranelift-module
+# and the Pulley32 ISA (the only 32-bit-pointer TargetIsa — Module::isa() needs one).
+module-seam = ["dep:cranelift-module", "dep:target-lexicon", "cranelift-codegen/pulley"]
+
+[dependencies]
+# IR types only — no ISA backend, no ctx.compile(). Pinned to the cranelift version
+# cg_clif uses (matches spikes/c1-cranelift-on-wasm).
+cranelift-codegen = { version = "=0.130.0", default-features = false, features = ["std"] }
+# Used to SYNTHESIZE runtime functions (__udivti3 family) as CLIF fed through our own
+# translator — vastly more maintainable than hand-writing the loops in waffle IR.
+cranelift-frontend = "=0.130.0"
+cranelift-module = { version = "=0.130.0", optional = true }
+target-lexicon = { version = "0.13", optional = true }
+# The load-bearing bet: CLIF-shaped SSA in, structured wasm out. Pinned exact (pre-1.0).
+waffle = "=0.3.0"
+anyhow = "1.0"
+# Object emission (src/object.rs) harvests function bodies out of waffle's emitted
+# module. Matches waffle's internal minor so one copy is shared.
+wasmparser = "0.248"
+
