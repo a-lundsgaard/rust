@@ -1,0 +1,12 @@
+[package]
+name = "riwl"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Minimal wasm static linker for the rust-in-wasm playground (Phase B)"
+
+[dependencies]
+# Match the version family used across the project (waffle/clif2wasm are on 0.248).
+wasmparser = "0.248"
+anyhow = "1.0"
+
