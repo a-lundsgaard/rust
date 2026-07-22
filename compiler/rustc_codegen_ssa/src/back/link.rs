@@ -880,18 +880,24 @@ fn link_natively(
     // Invoke the system linker
     info!("{cmd:?}");
 
+    // WASM FORK: a wasi-hosted rustc cannot spawn a linker process. Link
+    // IN-PROCESS with riwl (the project's minimal wasm linker) — one rustc.wasm
+    // invocation compiles AND links. (Upstream branch used libwild here, which
+    // is ELF-only; riwl replaces it for the wasm targets this compiler serves.)
     #[cfg(target_os = "wasi")]
     {
-        let cmd = cmd.command();
-        println!("Linking using {cmd:?}");
-
-        let mut args =
-            libwild::args::Args::new(|| cmd.get_args().map(|arg| arg.to_str().unwrap())).unwrap();
-        args.parse(|| cmd.get_args().map(|arg| arg.to_str().unwrap())).unwrap();
-        if let Err(err) = libwild::run(args) {
-            libwild::error::report_error_and_exit(&err);
-        } else {
-            std::process::exit(0);
+        let args: Vec<String> = cmd
+            .get_args_raw()
+            .iter()
+            .map(|arg| arg.to_str().unwrap().to_string())
+            .filter(|a| a != "-flavor" && a != "wasm")
+            .collect();
+        match riwl::cli::run_args(args) {
+            Ok(()) => std::process::exit(0),
+            Err(err) => {
+                eprintln!("riwl: error: {err:#}");
+                std::process::exit(1);
+            }
         }
     }
 
@@ -1440,6 +1446,17 @@ pub fn ignored_for_lto(sess: &Session, info: &CrateInfo, cnum: CrateNum) -> bool
 
 /// This functions tries to determine the appropriate linker (and corresponding LinkerFlavor) to use
 pub fn linker_and_flavor(sess: &Session) -> (PathBuf, LinkerFlavor) {
+    // WASM FORK: on a wasi host the link runs IN-PROCESS via riwl, which consumes
+    // wasm-ld-style args. Ignore the baked-in default linker (bootstrap's target
+    // config points it at wasi-sdk clang, a cc-style driver) for wasm targets.
+    #[cfg(target_os = "wasi")]
+    if sess.target.arch == rustc_target::spec::Arch::Wasm32 {
+        return (
+            PathBuf::from("riwl"),
+            LinkerFlavor::WasmLld(rustc_target::spec::Cc::No),
+        );
+    }
+
     fn infer_from(
         sess: &Session,
         linker: Option<PathBuf>,

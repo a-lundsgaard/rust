@@ -10,7 +10,7 @@
 //! was since renamed to `wasm32-wasip1` after the preview2 target was
 //! introduced.
 
-use crate::spec::{
+use crate::spec::{LinkSelfContainedComponents, 
     Arch, Cc, Env, LinkSelfContainedDefault, LinkerFlavor, Os, Target, TargetMetadata, base,
     crt_objects,
 };
@@ -26,7 +26,13 @@ pub(crate) fn target() -> Target {
     options.post_link_objects_self_contained = crt_objects::post_wasi_self_contained();
 
     // FIXME: Figure out cases in which WASM needs to link with a native toolchain.
-    options.link_self_contained = LinkSelfContainedDefault::False;
+    // WASM FORK: self-contained CRT OBJECTS on (the sysroot ships
+    // crt1-command.o + libc.a and the in-process riwl link needs them on the
+    // line) — but NOT the self-contained linker component, which would make
+    // bootstrap's own wasip1 host link of rustc.wasm demand a sysroot rust-lld.
+    options.link_self_contained = LinkSelfContainedDefault::WithComponents(
+        LinkSelfContainedComponents::CRT_OBJECTS.union(LinkSelfContainedComponents::LIBC),
+    );
 
     // Right now this is a bit of a workaround but we're currently saying that
     // the target by default has a static crt which we're taking as a signal

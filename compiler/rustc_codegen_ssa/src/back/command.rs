@@ -51,6 +51,12 @@ impl Command {
         self
     }
 
+    // WASM FORK: the in-process riwl link needs the raw arg list; std's
+    // process::Command is a black box on wasi.
+    pub(crate) fn get_args_raw(&self) -> &[OsString] {
+        &self.args
+    }
+
     pub(crate) fn args<I>(&mut self, args: I) -> &mut Command
     where
         I: IntoIterator<Item: AsRef<OsStr>>,
