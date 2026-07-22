@@ -129,7 +129,29 @@ impl OngoingCodegen {
     }
 }
 
-fn make_module(sess: &Session, name: String) -> UnwindModule<ObjectModule> {
+/// WASM FORK: native object pipeline or the CLIF->wasm translator, selected on
+/// Arch::Wasm32. Codegen drives either through &mut dyn Module.
+pub(crate) enum BackendModule {
+    Native(UnwindModule<ObjectModule>),
+    Wasm(clif2wasm::module_impl::WasmModule),
+}
+
+impl BackendModule {
+    fn as_dyn(&mut self) -> &mut dyn Module {
+        match self {
+            BackendModule::Native(m) => m,
+            BackendModule::Wasm(m) => m,
+        }
+    }
+}
+
+fn make_module(sess: &Session, name: String) -> BackendModule {
+    if sess.target.arch == rustc_target::spec::Arch::Wasm32 {
+        return BackendModule::Wasm(
+            clif2wasm::module_impl::WasmModule::new()
+                .unwrap_or_else(|err| sess.dcx().fatal(format!("wasm backend init: {err}"))),
+        );
+    }
     let isa = crate::build_isa(sess, false);
 
     let mut builder =
@@ -145,7 +167,7 @@ fn make_module(sess: &Session, name: String) -> UnwindModule<ObjectModule> {
         sess.opts.unstable_opts.function_sections.unwrap_or(default_function_sections),
     );
 
-    UnwindModule::new(ObjectModule::new(builder), true)
+    BackendModule::Native(UnwindModule::new(ObjectModule::new(builder), true))
 }
 
 fn emit_cgu(
@@ -153,11 +175,57 @@ fn emit_cgu(
     invocation_temp: Option<&str>,
     prof: &SelfProfilerRef,
     name: String,
-    module: UnwindModule<ObjectModule>,
+    module: BackendModule,
     debug: Option<DebugContext>,
     global_asm_object_file: Option<PathBuf>,
     producer: &str,
 ) -> Result<ModuleCodegenResult, String> {
+    // WASM FORK: the translator emits a complete wasm module; its bytes ARE the
+    // "object file" rustc tracks.
+    let module = match module {
+        BackendModule::Native(module) => module,
+        BackendModule::Wasm(wasm_module) => {
+            // CLIF2WASM_OBJECT=1 (Phase B): emit a RELOCATABLE wasm object
+            // (tool-conventions linking format) for a real linker instead of a
+            // complete stub-filled module.
+            let object_mode =
+                std::env::var_os("CLIF2WASM_OBJECT").is_some_and(|v| v == "1");
+            let bytes = if object_mode {
+                wasm_module.finish_object()
+            } else {
+                wasm_module.finish()
+            }
+            .map_err(|err| format!("wasm emission failed: {err:#}"))?;
+            let tmp_file =
+                output_filenames.temp_path_for_cgu(OutputType::Object, &name, invocation_temp);
+            std::fs::write(&tmp_file, &bytes)
+                .map_err(|err| format!("error writing wasm object file: {err}"))?;
+            let module_regular = CompiledModule {
+                name: name.clone(),
+                kind: ModuleKind::Regular,
+                object: Some(tmp_file),
+                dwarf_object: None,
+                bytecode: None,
+                assembly: None,
+                llvm_ir: None,
+                links_from_incr_cache: Vec::new(),
+            };
+            return Ok(ModuleCodegenResult {
+                module_regular,
+                module_global_asm: global_asm_object_file.map(|f| CompiledModule {
+                    name: format!("{name}.asm"),
+                    kind: ModuleKind::Regular,
+                    object: Some(f),
+                    dwarf_object: None,
+                    bytecode: None,
+                    assembly: None,
+                    llvm_ir: None,
+                    links_from_incr_cache: Vec::new(),
+                }),
+                existing_work_product: None,
+            });
+        }
+    };
     let mut product = module.finish();
 
     if let Some(mut debug) = debug {
@@ -389,7 +457,7 @@ fn module_codegen(
     let mut module = make_module(tcx.sess, cgu_name.as_str().to_string());
 
     let (mut debug_context, codegened_functions, mut global_asm) =
-        codegen_cgu_content(tcx, &mut module, cgu_name);
+        codegen_cgu_content(tcx, module.as_dyn(), cgu_name);
 
     let cgu_name = cgu_name.as_str().to_owned();
 
@@ -413,7 +481,7 @@ fn module_codegen(
                     &output_filenames,
                     should_write_ir,
                     &mut cached_context,
-                    &mut module,
+                    module.as_dyn(),
                     debug_context.as_mut(),
                     &mut global_asm,
                     codegened_func,
@@ -451,10 +519,41 @@ fn module_codegen(
 
 fn emit_allocator_module(tcx: TyCtxt<'_>) -> Option<CompiledModule> {
     let mut allocator_module = make_module(tcx.sess, "allocator_shim".to_string());
-    let created_alloc_shim = crate::allocator::codegen(tcx, &mut allocator_module);
+    let created_alloc_shim = crate::allocator::codegen(tcx, allocator_module.as_dyn());
 
     if created_alloc_shim {
-        let product = allocator_module.finish();
+        // WASM FORK: allocator shim on wasm targets goes through the translator.
+        let product = match allocator_module {
+            BackendModule::Native(m) => m,
+            BackendModule::Wasm(wasm_module) => {
+                let object_mode =
+                    std::env::var_os("CLIF2WASM_OBJECT").is_some_and(|v| v == "1");
+                let bytes = if object_mode {
+                    wasm_module.finish_object()
+                } else {
+                    wasm_module.finish()
+                }
+                .unwrap_or_else(|err| tcx.dcx().fatal(format!("wasm emission failed: {err:#}")));
+                let tmp_file = tcx.output_filenames(()).temp_path_for_cgu(
+                    OutputType::Object,
+                    "allocator_shim",
+                    tcx.sess.invocation_temp.as_deref(),
+                );
+                std::fs::write(&tmp_file, &bytes)
+                    .unwrap_or_else(|err| tcx.dcx().fatal(format!("error writing wasm object: {err}")));
+                return Some(CompiledModule {
+                    name: "allocator_shim".to_owned(),
+                    kind: ModuleKind::Allocator,
+                    object: Some(tmp_file),
+                    dwarf_object: None,
+                    bytecode: None,
+                    assembly: None,
+                    llvm_ir: None,
+                    links_from_incr_cache: Vec::new(),
+                });
+            }
+        }
+        .finish();
 
         match emit_module(
             tcx.output_filenames(()),

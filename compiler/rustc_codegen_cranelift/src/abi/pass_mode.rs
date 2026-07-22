@@ -40,7 +40,7 @@ fn apply_attrs_to_abi_param(param: AbiParam, arg_attrs: ArgAttributes) -> AbiPar
     }
 }
 
-fn cast_target_to_abi_params(cast: &CastTarget) -> SmallVec<[(Size, AbiParam); 2]> {
+pub(super) fn cast_target_to_abi_params(cast: &CastTarget) -> SmallVec<[(Size, AbiParam); 2]> {
     if let Some(offset_from_start) = cast.rest_offset {
         assert!(cast.prefix[1..].iter().all(|p| p.is_none()));
         assert_eq!(cast.rest.unit.size, cast.rest.total);

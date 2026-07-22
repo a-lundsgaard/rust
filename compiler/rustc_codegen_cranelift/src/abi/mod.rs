@@ -31,6 +31,39 @@ use crate::base::codegen_unwind_terminate;
 use crate::debuginfo::EXCEPTION_HANDLER_CLEANUP;
 use crate::prelude::*;
 
+
+/// WASM FORK: LLVM's wasm backend legalizes any multi-scalar RETURN to sret
+/// (the multivalue-return ABI is off in stock std builds), while cg_clif lowers
+/// `PassMode::Pair`/i128-`Direct`/multi-reg `Cast` returns as multiple return
+/// values. That breaks link-time signature parity with LLVM-built rlibs (wasm-ld
+/// validates signatures). Force the same indirect-return rule for wasm targets —
+/// applied at EVERY FnAbi retrieval (definitions and calls), so both sides of
+/// every boundary agree by construction. Arguments already match (LLVM splits
+/// i128 args into 2xi64 and passes pairs as two params, as we do).
+pub(crate) fn wasm_adjust_fn_abi<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    fn_abi: &'tcx FnAbi<'tcx, Ty<'tcx>>,
+) -> &'tcx FnAbi<'tcx, Ty<'tcx>> {
+    if tcx.sess.target.arch != rustc_target::spec::Arch::Wasm32 {
+        return fn_abi;
+    }
+    let needs_indirect = match &fn_abi.ret.mode {
+        PassMode::Pair(..) => true,
+        PassMode::Cast { cast, .. } => {
+            pass_mode::cast_target_to_abi_params(cast).len() > 1
+        }
+        // i128 (single scalar wider than one wasm value; f64 and below stay direct).
+        PassMode::Direct(_) => fn_abi.ret.layout.size.bytes() > 8,
+        _ => false,
+    };
+    if !needs_indirect {
+        return fn_abi;
+    }
+    let mut adjusted = fn_abi.clone();
+    adjusted.ret.make_indirect();
+    tcx.arena.alloc(adjusted)
+}
+
 fn clif_sig_from_fn_abi<'tcx>(
     tcx: TyCtxt<'tcx>,
     default_call_conv: CallConv,
@@ -88,7 +121,10 @@ pub(crate) fn get_function_sig<'tcx>(
     clif_sig_from_fn_abi(
         tcx,
         default_call_conv,
-        FullyMonomorphizedLayoutCx(tcx).fn_abi_of_instance(inst, ty::List::empty()),
+        wasm_adjust_fn_abi(
+            tcx,
+            FullyMonomorphizedLayoutCx(tcx).fn_abi_of_instance(inst, ty::List::empty()),
+        ),
     )
 }
 
@@ -187,7 +223,22 @@ impl<'tcx> FunctionCx<'_, '_, 'tcx> {
         args: &[Value],
     ) -> &[Value] {
         let sig = Signature { params, returns, call_conv: self.target_config.default_call_conv };
-        let func_id = self.module.declare_function(name, Linkage::Import, &sig).unwrap();
+        // WASM FORK: tolerate libcall signature drift (f128 helpers) by rerouting to a
+        // fresh trap import — see rust-in-wasm third_party/cg_clif/PROVENANCE.md.
+        let func_id = match self.module.declare_function(name, Linkage::Import, &sig) {
+            Ok(id) => id,
+            Err(cranelift_module::ModuleError::IncompatibleSignature(..))
+                if std::env::var_os("CLIF2WASM_LENIENT").is_some_and(|v| v == "1") =>
+            {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                format!("{sig:?}").hash(&mut h);
+                let drift_name = format!("{name}$drift${:08x}", h.finish() as u32);
+                eprintln!("clif2wasm-gap: libcall signature drift rerouted: {drift_name}");
+                self.module.declare_function(&drift_name, Linkage::Import, &sig).unwrap()
+            }
+            Err(err) => panic!("{err:?}"),
+        };
         let func_ref = self.module.declare_func_in_func(func_id, self.bcx.func);
         let call_inst = self.bcx.ins().call(func_ref, args);
         if self.clif_comments.enabled() {
@@ -469,6 +520,7 @@ pub(crate) fn codegen_terminator_call<'tcx>(
     } else {
         FullyMonomorphizedLayoutCx(fx.tcx).fn_abi_of_fn_ptr(fn_sig, extra_args)
     };
+    let fn_abi = wasm_adjust_fn_abi(fx.tcx, fn_abi); // WASM FORK
 
     let is_cold = if fn_sig.abi() == ExternAbi::RustCold {
         true
@@ -739,8 +791,11 @@ pub(crate) fn codegen_drop<'tcx>(
                     def: ty::InstanceKind::Virtual(drop_instance.def_id(), 0),
                     args: drop_instance.args,
                 };
-                let fn_abi = FullyMonomorphizedLayoutCx(fx.tcx)
-                    .fn_abi_of_instance(virtual_drop, ty::List::empty());
+                let fn_abi = wasm_adjust_fn_abi(
+                    fx.tcx,
+                    FullyMonomorphizedLayoutCx(fx.tcx)
+                        .fn_abi_of_instance(virtual_drop, ty::List::empty()),
+                ); // WASM FORK
 
                 let sig = clif_sig_from_fn_abi(fx.tcx, fx.target_config.default_call_conv, fn_abi);
                 let sig = fx.bcx.import_signature(sig);
@@ -756,8 +811,11 @@ pub(crate) fn codegen_drop<'tcx>(
             _ => {
                 assert!(!matches!(drop_instance.def, InstanceKind::Virtual(_, _)));
 
-                let fn_abi = FullyMonomorphizedLayoutCx(fx.tcx)
-                    .fn_abi_of_instance(drop_instance, ty::List::empty());
+                let fn_abi = wasm_adjust_fn_abi(
+                    fx.tcx,
+                    FullyMonomorphizedLayoutCx(fx.tcx)
+                        .fn_abi_of_instance(drop_instance, ty::List::empty()),
+                ); // WASM FORK
 
                 let arg_value = drop_place.place_ref(
                     fx,

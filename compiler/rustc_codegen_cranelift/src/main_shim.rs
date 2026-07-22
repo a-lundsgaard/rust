@@ -53,11 +53,19 @@ pub(crate) fn maybe_create_entry_wrapper(
             main_ret_ty.no_bound_vars().unwrap(),
         );
 
+        // WASM FORK: wasip1's command model (crt1-command.o) calls `__main_void()`
+        // with NO arguments — targets with main_needs_argc_argv=false get a niladic
+        // entry that passes (0, 0) to lang_start (std fetches real args via WASI).
+        let needs_argc_argv = tcx.sess.target.options.main_needs_argc_argv;
         let cmain_sig = Signature {
-            params: vec![
-                AbiParam::new(m.target_config().pointer_type()),
-                AbiParam::new(m.target_config().pointer_type()),
-            ],
+            params: if needs_argc_argv {
+                vec![
+                    AbiParam::new(m.target_config().pointer_type()),
+                    AbiParam::new(m.target_config().pointer_type()),
+                ]
+            } else {
+                vec![]
+            },
             returns: vec![AbiParam::new(m.target_config().pointer_type() /*isize*/)],
             call_conv: crate::conv_to_call_conv(
                 tcx.sess,
@@ -89,8 +97,18 @@ pub(crate) fn maybe_create_entry_wrapper(
 
             let block = bcx.create_block();
             bcx.switch_to_block(block);
-            let arg_argc = bcx.append_block_param(block, m.target_config().pointer_type());
-            let arg_argv = bcx.append_block_param(block, m.target_config().pointer_type());
+            // WASM FORK: see needs_argc_argv above.
+            let (arg_argc, arg_argv) = if needs_argc_argv {
+                (
+                    bcx.append_block_param(block, m.target_config().pointer_type()),
+                    bcx.append_block_param(block, m.target_config().pointer_type()),
+                )
+            } else {
+                (
+                    bcx.ins().iconst(m.target_config().pointer_type(), 0),
+                    bcx.ins().iconst(m.target_config().pointer_type(), 0),
+                )
+            };
             let arg_sigpipe = bcx.ins().iconst(types::I8, sigpipe as i64);
 
             let main_func_ref = m.declare_func_in_func(main_func_id, bcx.func);

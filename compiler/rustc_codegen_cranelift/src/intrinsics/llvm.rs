@@ -19,6 +19,33 @@ pub(crate) fn codegen_llvm_intrinsic_call<'tcx>(
     }
 
     match intrinsic {
+        // WASM FORK: std's allocator (dlmalloc) bottoms out in these. Route them to
+        // translator-synthesized shims (clif2wasm RuntimeFn::MemoryGrow/MemorySize,
+        // lowered to the real memory.grow / memory.size instructions).
+        "llvm.wasm.memory.grow.i32" => {
+            intrinsic_args!(fx, args => (mem, delta); intrinsic);
+            let mem = mem.load_scalar(fx);
+            let delta = delta.load_scalar(fx);
+            let ret_val = fx.lib_call(
+                "__clif2wasm_memory_grow",
+                vec![AbiParam::new(types::I32), AbiParam::new(types::I32)],
+                vec![AbiParam::new(types::I32)],
+                &[mem, delta],
+            )[0];
+            ret.write_cvalue(fx, CValue::by_val(ret_val, ret.layout()));
+        }
+        "llvm.wasm.memory.size.i32" => {
+            intrinsic_args!(fx, args => (mem); intrinsic);
+            let mem = mem.load_scalar(fx);
+            let ret_val = fx.lib_call(
+                "__clif2wasm_memory_size",
+                vec![AbiParam::new(types::I32)],
+                vec![AbiParam::new(types::I32)],
+                &[mem],
+            )[0];
+            ret.write_cvalue(fx, CValue::by_val(ret_val, ret.layout()));
+        }
+
         "llvm.prefetch" => {
             // Nothing to do. This is merely a perf hint.
         }
