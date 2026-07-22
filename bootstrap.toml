@@ -6,7 +6,7 @@ change-id = 9999999
 download-ci-llvm = true
 
 [rust]
-codegen-backends = ["llvm"]
+codegen-backends = ["llvm", "cranelift"]
 deny-warnings = false
 llvm-tools = false
 llvm-bitcode-linker = false
