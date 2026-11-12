@@ -222,6 +222,33 @@ pub fn lower_inst(
                 b
             };
 
+            // High half of a widening multiply: what cg_clif emits for overflow-checked
+            // `*`, `checked_mul`, `pow` and integer parsing. wasm has no such instruction.
+            if matches!(opcode, Opcode::Umulhi | Opcode::Smulhi) {
+                let signed = opcode == Opcode::Smulhi;
+                let wv = match rty {
+                    types::I64 if signed => i128_lower::smulhi64(body, wb, a, b),
+                    types::I64 => i128_lower::umulhi64(body, wb, a, b),
+                    types::I32 => {
+                        // The full product fits in i64: widen, multiply, keep bits 32..64.
+                        let (extend, shift) = if signed {
+                            (Operator::I64ExtendI32S, Operator::I64ShrS)
+                        } else {
+                            (Operator::I64ExtendI32U, Operator::I64ShrU)
+                        };
+                        let a64 = body.add_op(wb, extend, &[a], &[Type::I64]);
+                        let b64 = body.add_op(wb, extend, &[b], &[Type::I64]);
+                        let product = body.add_op(wb, Operator::I64Mul, &[a64, b64], &[Type::I64]);
+                        let c32 = body.add_op(wb, Operator::I64Const { value: 32 }, &[], &[Type::I64]);
+                        let high = body.add_op(wb, shift, &[product, c32], &[Type::I64]);
+                        body.add_op(wb, Operator::I32WrapI64, &[high], &[Type::I32])
+                    }
+                    _ => bail!("unimplemented binary opcode {opcode} on {rty}"),
+                };
+                cx.bind1(result, wv);
+                return Ok(());
+            }
+
             let op = match (opcode, wty) {
                 (Opcode::Iadd, Type::I32) => Operator::I32Add,
                 (Opcode::Iadd, Type::I64) => Operator::I64Add,

@@ -41,22 +41,20 @@ pub fn sub(body: &mut FunctionBody, wb: waffle::Block, a: Pair, b: Pair) -> Pair
     (lo, hi)
 }
 
-/// Full 128-bit multiply from 64-bit halves: lo = lo(a.0*b.0);
-/// hi = a.1*b.0 + a.0*b.1 + umulhi64(a.0, b.0), with umulhi64 built from 32-bit
-/// partial products.
-pub fn mul(body: &mut FunctionBody, wb: waffle::Block, a: Pair, b: Pair) -> Pair {
+/// High 64 bits of the unsigned 128-bit product of two i64 values (CLIF `umulhi.i64`),
+/// built from carry-correct 32-bit partial products: wasm has no wide multiply.
+pub fn umulhi64(body: &mut FunctionBody, wb: waffle::Block, a: Value, b: Value) -> Value {
     use Operator::*;
     let mask32 = c64(body, wb, 0xFFFF_FFFF);
     let c32 = c64(body, wb, 32);
     let lo32 = |body: &mut FunctionBody, v: Value| op1(body, wb, I64And, &[v, mask32], Type::I64);
     let hi32 = |body: &mut FunctionBody, v: Value| op1(body, wb, I64ShrU, &[v, c32], Type::I64);
 
-    let al = lo32(body, a.0);
-    let ah = hi32(body, a.0);
-    let bl = lo32(body, b.0);
-    let bh = hi32(body, b.0);
+    let al = lo32(body, a);
+    let ah = hi32(body, a);
+    let bl = lo32(body, b);
+    let bh = hi32(body, b);
 
-    // umulhi64(a.0, b.0) with carry-correct 32-bit partials.
     let lo_lo = op1(body, wb, I64Mul, &[al, bl], Type::I64);
     let t1 = op1(body, wb, I64Mul, &[ah, bl], Type::I64);
     let mid1 = {
@@ -69,13 +67,33 @@ pub fn mul(body: &mut FunctionBody, wb: waffle::Block, a: Pair, b: Pair) -> Pair
         op1(body, wb, I64Add, &[t2, l], Type::I64)
     };
     let t3 = op1(body, wb, I64Mul, &[ah, bh], Type::I64);
-    let hi_of_lo = {
-        let h1 = hi32(body, mid1);
-        let h2 = hi32(body, mid2);
-        let s = op1(body, wb, I64Add, &[t3, h1], Type::I64);
-        op1(body, wb, I64Add, &[s, h2], Type::I64)
-    };
+    let h1 = hi32(body, mid1);
+    let h2 = hi32(body, mid2);
+    let s = op1(body, wb, I64Add, &[t3, h1], Type::I64);
+    op1(body, wb, I64Add, &[s, h2], Type::I64)
+}
 
+/// High 64 bits of the signed 128-bit product (CLIF `smulhi.i64`). Reinterpreting a
+/// negative operand as unsigned adds 2^64 times the other operand to the product, so
+/// the signed high half is the unsigned one minus each such correction.
+pub fn smulhi64(body: &mut FunctionBody, wb: waffle::Block, a: Value, b: Value) -> Value {
+    use Operator::*;
+    let hi = umulhi64(body, wb, a, b);
+    let c63 = c64(body, wb, 63);
+    // `x >> 63` (arithmetic) is all ones for a negative x, so `& other` selects the correction.
+    let a_sign = op1(body, wb, I64ShrS, &[a, c63], Type::I64);
+    let b_sign = op1(body, wb, I64ShrS, &[b, c63], Type::I64);
+    let a_fix = op1(body, wb, I64And, &[a_sign, b], Type::I64);
+    let b_fix = op1(body, wb, I64And, &[b_sign, a], Type::I64);
+    let hi = op1(body, wb, I64Sub, &[hi, a_fix], Type::I64);
+    op1(body, wb, I64Sub, &[hi, b_fix], Type::I64)
+}
+
+/// Full 128-bit multiply from 64-bit halves: lo = lo(a.0*b.0);
+/// hi = a.1*b.0 + a.0*b.1 + umulhi64(a.0, b.0).
+pub fn mul(body: &mut FunctionBody, wb: waffle::Block, a: Pair, b: Pair) -> Pair {
+    use Operator::*;
+    let hi_of_lo = umulhi64(body, wb, a.0, b.0);
     let lo = op1(body, wb, I64Mul, &[a.0, b.0], Type::I64);
     let cross1 = op1(body, wb, I64Mul, &[a.1, b.0], Type::I64);
     let cross2 = op1(body, wb, I64Mul, &[a.0, b.1], Type::I64);
