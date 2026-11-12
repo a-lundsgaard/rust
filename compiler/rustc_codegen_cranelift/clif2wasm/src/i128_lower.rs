@@ -2,7 +2,8 @@
 //!
 //! This is Milestone A's "i128 — mandatory" slice (plan §6): carry/borrow synthesis
 //! for add/sub, pairwise logic, hi/lo-combined comparisons, and branchless dynamic
-//! shifts via `select`. Multiplication is deliberately left on the gap list.
+//! shifts via `select`, and multiplication: the full i128 product and the
+//! high half of an i64 product (`umulhi64`, `smulhi64`), which wasm lacks.
 
 use anyhow::{bail, Result};
 use cranelift_codegen::ir::condcodes::IntCC;
